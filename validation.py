@@ -6,11 +6,13 @@ import ufl
 from mpi4py import MPI
 import matplotlib.pyplot as plt
 import numpy as np
+import scipy.sparse
+import scipy.linalg
 from petsc4py import PETSc
 from slepc4py import SLEPc
 
 # beam properties
-n_ele = 100
+n_ele = 50
 start_x = 0.0
 end_x = 1.0
 E = 1e6
@@ -73,10 +75,10 @@ def solve_eigenmodes(KM, MM, dims = 5, target_freq = 0.0, print_status = True):
     pc.setType(pc.Type.CHOLESKY)
 
     ksp = PETSc.KSP().create(MPI.COMM_WORLD)
-    ksp.setType(ksp.Type.LGMRES)
-    ksp.setTolerances(rtol=1E-5)
+    ksp.setType(ksp.Type.PREONLY)
     ksp.setPC(pc)
-
+    #ksp.setTolerances(rtol=1E-9)
+    
     st = SLEPc.ST().create(MPI.COMM_WORLD)
     st.setType(st.Type.SINVERT)
     st.setKSP(ksp)
@@ -108,7 +110,38 @@ def solve_eigenmodes(KM, MM, dims = 5, target_freq = 0.0, print_status = True):
 
     return solver
 
-def postprocess(mesh, KM, results, min_freq = 0.01, max_error = 1e-4):
+def extract_modes(results, N = 3, min_freq = 0.01, max_error = 1e-4):
+    vr, vi = KM.getVecs()
+    n_okay = 0
+    freqs = []
+    modes = []
+    
+    for i in range(results.getConverged()):
+        k = results.getEigenpair(i, vr, vi)
+        error = results.computeError(i)
+        if np.isnan(k.real) or k.real <= min_freq or error > max_error:
+            continue
+        n_okay += 1
+        if n_okay <= N:
+            freqs.append(np.sqrt(k.real))
+            modes.append(vr.copy())
+    
+    return freqs, modes
+
+def invert_stiffness(K):
+    ai, aj, av = K.getValuesCSR()
+    K_np = scipy.sparse.csr_matrix((av, aj, ai)).todense()
+    return scipy.linalg.inv(K_np, overwrite_a=False, check_finite=True)
+
+def calc_modal_thing(modes, what, V):
+    out = []
+    tmp = dolfinx.Function(V).vector
+    for m in modes:
+        what.mult(m, tmp)
+        out.append(m.dot(tmp))
+    return out
+
+def postprocess(mesh, V, KM, results, min_freq = 0.01, max_error = 1e-4):
 
     eigenmode = dolfinx.Function(V)
     nodes = mesh.geometry.x[:, 0]
@@ -123,23 +156,63 @@ def postprocess(mesh, KM, results, min_freq = 0.01, max_error = 1e-4):
     for i in range(results.getConverged()):
         k = results.getEigenpair(i, vr, vi)
         error = results.computeError(i)
-        if np.isnan(k.real) or k.real <= min_freq or error > max_error:
-            continue
-
-        n_okay += 1
-        print(" %12f       %12g" % (np.sqrt(k.real) / (2*np.pi), error)) # rad/s to Hz
-        if n_okay <= 3:
-            er = PETSc.Vec.getArray(vr)
-            eigenmode.vector.array[:] = (er / np.max(np.abs(er)))
-            eigenmode.vector.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
-            result = eigenmode.sub(0).compute_point_values()
-            plt.plot(nodes[order], result[order])
+        if not np.isnan(k.real) and k.real > min_freq and error < max_error:
+            n_okay += 1
+            print(" %12f       %12g" % (np.sqrt(k.real) / (2*np.pi), error)) # rad/s to Hz
+            if n_okay <= 4:
+                eigenmode.vector.array[:] = PETSc.Vec.getArray(vr)
+                eigenmode.vector.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+                result = eigenmode.sub(0).compute_point_values()
+                plt.plot(nodes[order], result[order] / np.max(np.abs(result[order])))
 
     print("")
+    plt.legend(["2-node", "3-node", "4-node", "5-node"])
     plt.show()
 
+# Newmark-Beta integrator (gamma = 0.5, beta = 1/6 are coefs for linear acceleration)
+def update_eta_newmark(dt, dis, vel, acc, wn, zeta, F, gamma = 0.5, beta = 1.0/6.0):
+    
+    a1 = 1 / (beta * np.pow(dt, 2)) + (gamma * 2 * zeta * wn) / (beta * dt)
+    a2 = 1 / (beta * dt) + (gamma / beta - 1) * (2 * zeta * wn)
+    a3 = (1 / (2 * beta) - 1) + dt * 2 * zeta * wn * (gamma / (2 * beta) - 1)
+
+    new_disp = (F + a1 * dis + a2 * vel + a3 * acc) / (np.pow(wn, 2) + a1)
+    new_veloc = (gamma / (beta * dt)) * (new_disp - dis) + (1 - gamma / beta) * vel + dt * (1 - gamma / (2 * beta)) * acc
+    new_accel = 1 / (beta * np.pow(dt, 2)) * (new_disp - dis) - (1 / (beta * dt)) * vel - (1 / (2 * beta) - 1) * acc
+
+    return new_disp, new_veloc, new_accel
+
+# Wilson-Theta integrator
+def update_eta_wilson(dt, dis, vel, acc, wn, zeta, F, theta = 1.4):
+    # equation of motion coefs
+    mg = 1.0
+    cg = 2.0 * zeta * wn
+    kg = wn**2
+    # effective stiffness
+    k = 6.0/(theta**2 * dt**2)*mg + 3.0/(theta * dt)*cg + kg
+    # predicted displacement
+    dis_theta = F / k
+    # generalised coords new state
+    new_acc = 6.0/(theta**3 * dt**2) * (dis_theta - dis) - 6.0/(theta**2 * dt) * vel + (1.0 - 3.0/theta) * acc
+    new_vel = vel + dt*0.5 * (acc + new_acc)
+    new_dis = dis + dt * vel + dt**2/6.0 * (new_acc + 2*acc)
+    return new_dis, new_vel, new_acc
+
+def effective_force(dt, mode, dis, vel, acc, wn, zeta, F):
+    # prediction coef
+    theta = 1.4
+    # equation of motion coefs
+    mg = 1.0
+    cg = 2.0 * zeta * wn
+    return mode.dot(F) + (6.0/(theta**2 * dt**2)*mg + 3.0/(theta*dt)*cg)*dis + (6.0/(theta*dt)*mg +2*cg)*vel + (2*mg + theta*dt*0.5)*acc
 
 mesh, V = create_mesh()
 KM, MM = create_matrices(V)
 results = solve_eigenmodes(KM, MM)
-postprocess(mesh, KM, results)
+freqs, modes = extract_modes(results)
+K_inv = invert_stiffness(KM)
+modal_masses = calc_modal_thing(modes, MM, V)
+modal_stiffness = calc_modal_thing(modes, KM, V)
+# TODO allow damping as CM = a*MM + b*KM
+
+postprocess(mesh, V, KM, results)

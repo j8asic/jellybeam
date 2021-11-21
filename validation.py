@@ -10,6 +10,7 @@ import scipy.sparse
 import scipy.linalg
 from petsc4py import PETSc
 from slepc4py import SLEPc
+from celluloid import Camera
 
 # beam properties
 n_ele = 50
@@ -30,7 +31,9 @@ def create_mesh():
     P1 = ufl.FiniteElement("CG", "interval", 1)
     ME = ufl.MixedElement([P2, P1])
     V = dolfinx.FunctionSpace(mesh, ME)
-    return mesh, V
+    nodes = mesh.geometry.x[:, 0]
+    order = np.argsort(nodes)
+    return mesh, V, order
 
 def create_matrices(V, lumped = False):
 
@@ -110,21 +113,19 @@ def solve_eigenmodes(KM, MM, dims = 5, target_freq = 0.0, print_status = True):
 
     return solver
 
-def extract_modes(results, N = 3, min_freq = 0.01, max_error = 1e-4):
+def extract_modes(results, V, N = 3, min_freq = 0.01, max_error = 1e-4):
     vr, vi = KM.getVecs()
-    n_okay = 0
     freqs = []
     modes = []
     
     for i in range(results.getConverged()):
         k = results.getEigenpair(i, vr, vi)
         error = results.computeError(i)
-        if np.isnan(k.real) or k.real <= min_freq or error > max_error:
-            continue
-        n_okay += 1
-        if n_okay <= N:
+        if len(freqs) < N and not np.isnan(k.real) and k.real > min_freq and error < max_error:
+            m = dolfinx.Function(V)
+            m.vector.array[:] = PETSc.Vec.getArray(vr)
+            modes.append(m)
             freqs.append(np.sqrt(k.real))
-            modes.append(vr.copy())
     
     return freqs, modes
 
@@ -135,17 +136,16 @@ def invert_stiffness(K):
 
 def calc_modal_thing(modes, what, V):
     out = []
-    tmp = dolfinx.Function(V).vector
+    tmp = dolfinx.Function(V)
     for m in modes:
-        what.mult(m, tmp)
-        out.append(m.dot(tmp))
+        what.mult(m.vector, tmp.vector)
+        #result = np.dot(m.sub(0).vector.array[order], )
+        out.append(m.vector.dot(tmp.vector))
     return out
 
-def postprocess(mesh, V, KM, results, min_freq = 0.01, max_error = 1e-4):
+def postprocess(mesh, V, order, KM, results, min_freq = 0.01, max_error = 1e-4):
 
     eigenmode = dolfinx.Function(V)
-    nodes = mesh.geometry.x[:, 0]
-    order = np.argsort(nodes)
     vr, vi = KM.getVecs()
     n_okay = 0
 
@@ -163,56 +163,115 @@ def postprocess(mesh, V, KM, results, min_freq = 0.01, max_error = 1e-4):
                 eigenmode.vector.array[:] = PETSc.Vec.getArray(vr)
                 eigenmode.vector.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
                 result = eigenmode.sub(0).compute_point_values()
-                plt.plot(nodes[order], result[order] / np.max(np.abs(result[order])))
+                plt.plot(mesh.geometry.x[order, 0], result[order] / np.max(np.abs(result[order])))
 
     print("")
     plt.legend(["2-node", "3-node", "4-node", "5-node"])
     plt.show()
 
 # Newmark-Beta integrator (gamma = 0.5, beta = 1/6 are coefs for linear acceleration)
-def update_eta_newmark(dt, dis, vel, acc, wn, zeta, F, gamma = 0.5, beta = 1.0/6.0):
+def update_eta_newmark(dt, dis, vel, acc, wn, zeta, F, Fprev, gamma = 0.5, beta = 1.0/6.0):
     
-    a1 = 1 / (beta * np.pow(dt, 2)) + (gamma * 2 * zeta * wn) / (beta * dt)
+    a1 = 1 / (beta * np.power(dt, 2)) + (gamma * 2 * zeta * wn) / (beta * dt)
     a2 = 1 / (beta * dt) + (gamma / beta - 1) * (2 * zeta * wn)
     a3 = (1 / (2 * beta) - 1) + dt * 2 * zeta * wn * (gamma / (2 * beta) - 1)
 
-    new_disp = (F + a1 * dis + a2 * vel + a3 * acc) / (np.pow(wn, 2) + a1)
+    new_disp = (F + a1 * dis + a2 * vel + a3 * acc) / (np.power(wn, 2) + a1)
     new_veloc = (gamma / (beta * dt)) * (new_disp - dis) + (1 - gamma / beta) * vel + dt * (1 - gamma / (2 * beta)) * acc
-    new_accel = 1 / (beta * np.pow(dt, 2)) * (new_disp - dis) - (1 / (beta * dt)) * vel - (1 / (2 * beta) - 1) * acc
+    new_accel = 1 / (beta * np.power(dt, 2)) * (new_disp - dis) - (1 / (beta * dt)) * vel - (1 / (2 * beta) - 1) * acc
 
     return new_disp, new_veloc, new_accel
 
-# Wilson-Theta integrator
-def update_eta_wilson(dt, dis, vel, acc, wn, zeta, F, theta = 1.4):
-    # equation of motion coefs
-    mg = 1.0
-    cg = 2.0 * zeta * wn
-    kg = wn**2
-    # effective stiffness
-    k = 6.0/(theta**2 * dt**2)*mg + 3.0/(theta * dt)*cg + kg
-    # predicted displacement
-    dis_theta = F / k
-    # generalised coords new state
-    new_acc = 6.0/(theta**3 * dt**2) * (dis_theta - dis) - 6.0/(theta**2 * dt) * vel + (1.0 - 3.0/theta) * acc
-    new_vel = vel + dt*0.5 * (acc + new_acc)
-    new_dis = dis + dt * vel + dt**2/6.0 * (new_acc + 2*acc)
-    return new_dis, new_vel, new_acc
+# Complementary Function and Particular Integral (CF&PI) method
+# "Fluid–Structure Interaction Using a Modal Approach", doi:10.1115/1.4004859
+def update_eta_cfpi(dt, dis, vel, acc, wn, zeta, F, Fprev):
+    #Fprev = F
+    s = np.sqrt(1 - zeta**2)
+    wts = wn * dt * s
+    e = np.exp(-zeta * wn * dt)
+    S, C = np.sin(wts), np.cos(wts)
 
-def effective_force(dt, mode, dis, vel, acc, wn, zeta, F):
-    # prediction coef
-    theta = 1.4
-    # equation of motion coefs
-    mg = 1.0
-    cg = 2.0 * zeta * wn
-    return mode.dot(F) + (6.0/(theta**2 * dt**2)*mg + 3.0/(theta*dt)*cg)*dis + (6.0/(theta*dt)*mg +2*cg)*vel + (2*mg + theta*dt*0.5)*acc
+    # complementary solution
+    new_dis = dis * e * (C + zeta/s*S) + vel * e * 1/(wn*s)*S
+    new_vel = vel * e * (C - zeta/s*S) - dis * e * wn/s*S
 
-mesh, V = create_mesh()
+    # particular solution
+    new_dis += \
+        -e * Fprev * ((zeta*wn*dt + 2*zeta**2 - 1)/(wn**2*wts) * S + (wn*dt+2*zeta)/(wn**3*dt)*C) \
+        + Fprev * 2*zeta/(wn**3 * dt) \
+        + e * F * ((2*zeta**2 - 1)/(wn**2*wts) * S + (2*zeta)/(wn**3*dt)*C) \
+        + F * (wn*dt - 2*zeta)/(wn**3*dt)
+
+    new_vel += \
+          e * Fprev * ((zeta + wn*dt)/(wn*wts) * S + 1/(wn**2*dt)*C) \
+        - Fprev * 1/(wn**2 * dt) \
+        - e * F * (zeta/(wn*wts) * S + 1/(wn**2*dt)*C) \
+        + F * 1/(wn**2*dt)
+
+    return new_dis, new_vel, acc
+
+mesh, V, order = create_mesh()
 KM, MM = create_matrices(V)
 results = solve_eigenmodes(KM, MM)
-freqs, modes = extract_modes(results)
+freqs, modes = extract_modes(results, V)
+n_modes = len(freqs)
 K_inv = invert_stiffness(KM)
 modal_masses = calc_modal_thing(modes, MM, V)
 modal_stiffness = calc_modal_thing(modes, KM, V)
 # TODO allow damping as CM = a*MM + b*KM
 
-postprocess(mesh, V, KM, results)
+#postprocess(mesh, V, order, KM, results)
+
+def calc_force(t, mesh, order):
+    F = dolfinx.Function(V)
+    u,v = F.split()
+    if t < 0.03:
+        u.interpolate(lambda x: ((x[0] > 0.5) * (1 - (4*(x[0] - 0.8))**2)) * t/0.03 * 5e-2)
+    return F
+
+dt, t, i = 1e-2, 0.0, 0
+dis, vel, acc, Fmodal = np.zeros(n_modes), np.zeros(n_modes), np.zeros(n_modes), np.zeros(n_modes)
+ds, ts = [[] for i in range(n_modes)], []
+fig = plt.figure()
+camera = Camera(fig)
+
+while t < 0.2:
+
+    F = calc_force(t, mesh, order)
+
+    yeah = dolfinx.Function(V)
+    yeah.vector.array[:] = np.dot(K_inv, F.vector.array)
+        
+    for j in range(n_modes):
+        wn = freqs[j]
+        mode = modes[j]
+        Fprev = Fmodal[j]
+        Fmodal[j] = mode.vector.dot(F.vector)
+        dis[j], vel[j], acc[j] = update_eta_cfpi(dt, dis[j], vel[j], acc[j], wn, 0.05, Fmodal[j], Fprev)
+        ds[j].append(dis[j])
+    if i % 20:
+        result = np.zeros_like(F.sub(0).compute_point_values())
+        for j in range(n_modes):
+            result += modes[j].sub(0).compute_point_values() * dis[j]
+        #plt.clf()
+        #plt.ylim([-2, 2])
+        #plt.plot(mesh.geometry.x[order, 0], result[order], c='black', lw=4)
+        #plt.scatter(mesh.geometry.x[order, 0], result[order], s=1e4*np.absolute(F.sub(0).compute_point_values()[order]), color='red')
+        #plt.draw()
+        #plt.pause(0.001)
+        #camera.snap()
+
+    ts.append(t)
+    i += 1
+    t += dt
+#plt.show()
+
+#animation = camera.animate(interval = 30)
+#animation.save('/home/josip/Temp/beam_01.mp4')
+
+for j in range(n_modes):
+    plt.plot(ts, ds[j])
+plt.xlim([0, 0.2])
+plt.ylim([-0.004, 0.004])
+plt.legend(["1", "2", "3"])
+plt.show()
